@@ -203,3 +203,30 @@ def UTM_to_image(utm_coords, image_id):
     im_coords = im_coords[:-1, :]/im_coords[-1]
     im_coords[0] = -im_coords[0] + nx 
     return im_coords
+
+
+def triangulate_Npts(pt2d_CxPx2, P_Cx3x4):
+    """
+    Triangulate multiple 3D points from two or more views by DLT.
+    """
+
+    assert pt2d_CxPx2.ndim == 3
+    assert P_Cx3x4.ndim == 3
+    Nc, Np, _ = pt2d_CxPx2.shape
+    assert P_Cx3x4.shape == (Nc, 3, 4)
+
+    # P0 - xP2
+    x = P_Cx3x4[:,0,:][:,None,:] - np.einsum('ij,ik->ijk', pt2d_CxPx2[:,:,0], P_Cx3x4[:,2,:])
+    # P1 - yP2
+    y = P_Cx3x4[:,1,:][:,None,:] - np.einsum('ij,ik->ijk', pt2d_CxPx2[:,:,1], P_Cx3x4[:,2,:])
+
+    Ab = np.concatenate([x, y])
+    Ab = np.swapaxes(Ab, 0, 1)
+    assert Ab.shape == (Np, Nc*2, 4)
+
+    A = Ab[:,:,:3]
+    b = - Ab[:,:,3]
+    AtA = np.linalg.pinv(A)
+
+    X = np.einsum('ijk,ik->ij', AtA, b)
+    return X

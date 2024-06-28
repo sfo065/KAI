@@ -11,7 +11,7 @@ import os, sys
 import PIL
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
-print(os.getcwd())
+import random
 PIL.Image.MAX_IMAGE_PIXELS = None
 
 class Building:
@@ -31,6 +31,8 @@ class Building:
         self.utm_mean = np.mean(utm_corners, axis=0)
         self.image_ids = list()
         self.image_corners = list()
+        self.cutout_corners = list()
+        self.images = list()
         self.id = id
 
     def plot_SFKB(self, ax):
@@ -40,10 +42,22 @@ class Building:
         ax.set_aspect('equal')
         for i, edge in enumerate(self.edges):
             for ind in edge:
-                plt.plot([self.utm_corners[i, 0], self.utm_corners[ind, 0]],
+                ax.plot([self.utm_corners[i, 0], self.utm_corners[ind, 0]],
                          [self.utm_corners[i, 1], self.utm_corners[ind, 1]],
                           zorder=0, color='darkorange')
         ax.scatter(*self.utm_corners.T[:2], color='red', s=15)
+    
+    def plot_image_coords(self, axs):
+        '''
+        Plots transformed building graphs
+        '''
+        for i, corners in enumerate(self.image_corners):
+            for j, edge in enumerate(self.edges):
+                for ind in edge:
+                    axs[i].plot([corners[j, 0], corners[ind, 0]],
+                                [corners[j, 1], corners[ind, 1]],
+                                zorder=0, color='darkorange')
+            axs[i].scatter(*corners.T, color='red', s=15)
 
 def shrink_polygon(image_polygon, factor=0.10):
     """
@@ -79,66 +93,88 @@ def load_sfkb(json_path='../data/SFKB/geojson.json', max_buildings=None):
             edges = list()
 
             for i, item in enumerate(keys):
-                utm_corners[i] = np.array(item.split(','), dtype='float')
+                utm_corners[i] = np.array(item.split(','), dtype='float') # collect corner coords
 
-            for i, item in enumerate(keys):
-                edge_value = np.array(building['nodes'][item])
+            for item in keys:
+                edge_value = np.array(building['nodes'][item]) # collect edge coords
                 edge = np.empty(edge_value.shape[0])
                 
                 for i, edg in enumerate(edge_value):
-                    edge[i] = np.flatnonzero(np.prod(edg == utm_corners, axis=1))
+                    edge[i] = np.flatnonzero(np.prod(edg == utm_corners, axis=1)) # convert coords to indices
                 edges.append(edge.astype(int))
             
-            buildings.append(Building(utm_corners, edges, building['building_id']))
+            buildings.append(Building(utm_corners, edges, building['building_id'])) # Intialize building objects with utm corners, edges indices and building ids
     return buildings
 
-def get_image_ids(buildings, sosi_path = '../data/sosi.txt'):
+def get_image_ids(buildings, dict_dump_path='../results', sosi_path = '../data/sosi.txt'):
     '''
-    Gets the image coverage areas from the sosi file, 
-    and determins wether buildings are in the coverage area.
+    Gets the image coverage areas from the txt file converted from sosi, 
+    and determines whether buildings are in the coverage area.
     Image ids in which a building appears are added to building.building_ids before the instance is returned.
+    A dictionary representing which houses are present in each image is dumped at the dir given by "dict_dump_path".
+    this has format {Image_id: list of buildings}
     '''
     copy = False
     rect = list()
     rects = list()
+    ids = list()
 
-    with open(sosi_path, 'r') as infile: 
+    with open(sosi_path, 'r') as infile: # Parse coverage metadata file
         for line in infile:
-            if line.find('..OBJTYPE Bildegrense') != -1:
+            if line.startswith('..OBJTYPE Bildegrense'):
                 copy = True
                 rect = list()
 
-            if line.find('.FLATE') != -1:
+            if line.startswith('.FLATE'):
                 rects.append(rect)
                 copy = False
             
             if copy==True:
                 rect.append(line.split(','))
             
-
-    rects = rects[1:]  
+            if line.startswith('...BILDEFILRGB'):
+                ids.append(line.split('"')[1].split('.')[0])
+        rects.append(rect[:-1])
+    rects = rects[1:]
     coverage = list()
+    association_dict = dict()
 
-    for i, rect in enumerate(rects):
+
+    for i, rect in enumerate(rects): # Cleanup and conversion to int
         l_arr = np.empty((len(rect[2:]), 2))
+        association_dict[ids[i]] = list()
+        
         for j, item in enumerate(rect[2:]):
             line = item[0].replace(r'\n', ' ').split(' ')
             line[1] = line[1].split('\n')[0]
             line = np.array(line, dtype='int64')
             l_arr[j] = line
 
-        inds = (np.argmin(l_arr[:,0]), np.argmin(l_arr[:,1]),np.argmax(l_arr[:,0]), np.argmax(l_arr[:,1]))
-        poly = Polygon(l_arr[inds, ::-1])
-
+        inds = (np.argmin(l_arr[:,0]), np.argmin(l_arr[:,1]),np.argmax(l_arr[:,0]), np.argmax(l_arr[:,1])) # indices of rectangle corners
+        poly = Polygon(l_arr[inds, ::-1]) # coverage polygon in UTM coords for an aerial image
+        counter = 0
         for building in buildings:
-            if shrink_polygon(poly, factor=0.01).contains(Point(building.utm_mean[:-1])):
-                building.image_ids.append(i)
+            if shrink_polygon(poly, factor=0.01).contains(Point(building.utm_mean[:-1])): # Using shapely functionality to determine wether the mean of the building is within the coverage area
+                association_dict[ids[i]].append(building.id)
+                building.image_ids.append(ids[i])
+                building.cutout_corners.append(0)
+                counter +=1
+        
+        
         coverage.append(poly)
+        
+    for i, building in enumerate(buildings): # deletes building objects if the building is not in an image
+        if len(building.image_ids) <2 :
+            buildings.pop(i)
 
-    for i, building in enumerate(buildings):
-        if len(building.image_ids)<1:
-            del building[i]
+
+    if not os.path.exists(dict_dump_path):
+        os.makedirs(dict_dump_path)
+
+    with open(f'{dict_dump_path}/image_to_building_pointers.pickle', 'wb') as handle:
+        pickle.dump(association_dict, handle)  
     return buildings
+
 
 
 
@@ -160,20 +196,21 @@ def rotation_matrix(rx, ry, rz):
     
     return R1@R2@R3 
 
+
 def get_camera_properites(image_id, metadata_path='../data/Aerial_Photos/GNSSINS/EO_V355_TT-14525V_20210727_1.txt'):
     '''
     Fetches position and rotation of camera from the imaging project metadata file.
     Also returns the focal length and principal point coordinates 
+    Output: (x, y, z, rx, ry, rz, focal_length, ppa) 
     '''
     header = ['ID', 'x', 'y', 'z', 'rx', 'ry', 'rz']
     metadata = pd.read_table(metadata_path, comment='#', delim_whitespace=True, names=header, usecols=[0, 1, 2, 3, 5, 6, 7])
     metadata[['rx', 'ry', 'rz']] = metadata[['rx', 'ry', 'rz']].apply(np.deg2rad)
-
     focal_length = int(100.5*1e-3/4e-6) # image coordinates
     ny, nx = 26460, 17004
     ppa = np.array((nx/2 + int(0.08*1e-3/4e-6), ny/2)) # image coordinates
-
-    return [metadata.loc[image_id][i] for i in ['x', 'y', 'z', 'rx', 'ry', 'rz']].append([focal_length, ppa])
+    image_id_int = int(image_id[-3:])
+    return [metadata.loc[image_id_int][i] for i in ['x', 'y', 'z', 'rx', 'ry', 'rz']] + [focal_length, ppa]
 
 
 
@@ -191,19 +228,41 @@ def camera_matrix(image_id):
 
     return intrinsic_matrix@extrinsic_matrix
 
-def UTM_to_image(utm_coords, image_id):
+
+def utm_to_image(utm_coords, image_id):
     '''
     converts coordinates of a single building to the image coordinates 
     of a single aerial image.
     '''
     nx = 17004
     CM = camera_matrix(image_id)
-    utm_coords_hom = np.vstack([utm_coords, np.ones((1, utm_coords.shape[-1]))])
+    utm_coords_hom = np.vstack([utm_coords.T, np.ones((1, utm_coords.shape[0]))])
     im_coords = CM@utm_coords_hom
     im_coords = im_coords[:-1, :]/im_coords[-1]
     im_coords[0] = -im_coords[0] + nx 
-    return im_coords
+    return im_coords.T
 
+def transform_utm_buildings(buildings):
+    '''
+    Transforms utm coordinates of building corners from utm to image coordinates
+    in frames of every aerial photo in which the building appears
+    '''
+    for building in buildings:
+        for id in building.image_ids:
+            building.image_corners.append(utm_to_image(building.utm_corners, id))
+    return buildings
+
+
+def dump_building_objects(buildings, path):
+    '''
+    Saves every building object in 'buidling' list to file at location given by 'path' 
+    '''
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    for building in buildings:
+        with open(f'{path}/{building.id}.pickle', 'wb') as handle:
+            pickle.dump(building, handle)
 
 def triangulate_Npts(pt2d_CxPx2, P_Cx3x4):
     """

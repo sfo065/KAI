@@ -12,6 +12,7 @@ import PIL
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import random
+import cv2
 PIL.Image.MAX_IMAGE_PIXELS = None
 
 class Building:
@@ -29,10 +30,8 @@ class Building:
         self.utm_corners = utm_corners
         self.edges = edges
         self.utm_mean = np.mean(utm_corners, axis=0)
-        self.image_ids = list()
-        self.image_corners = list()
-        self.cutout_corners = list()
-        self.images = list()
+        self.image_corners = dict() #  {image id: image coordinate corners}
+        self.cutout_corners = dict()
         self.id = id
 
     def plot_SFKB(self, ax):
@@ -47,18 +46,47 @@ class Building:
                           zorder=0, color='darkorange')
         ax.scatter(*self.utm_corners.T[:2], color='red', s=15)
     
-    def plot_image_coords(self, axs):
+    def plot_image(self, axs):
         '''
         Plots transformed building graphs
         '''
-        for i, corners in enumerate(self.image_corners):
+        for i, corners in enumerate(self.image_corners.values()):
             for j, edge in enumerate(self.edges):
                 for ind in edge:
                     axs[i].plot([corners[j, 0], corners[ind, 0]],
                                 [corners[j, 1], corners[ind, 1]],
                                 zorder=0, color='darkorange')
             axs[i].scatter(*corners.T, color='red', s=15)
+    
+    def plot_cutout(self, plot_graph=False):
+        '''
+        Plots transformed building graphs in the cutout frame
+        '''
+        n = len(self.cutout_corners)
+        if n < 5:
+            fig, axs = plt.subplots(1, n, figsize=(n*3, 3))    
+        else:
+            fig, axs = plt.subplots((n-1)//5 + 1, 5, figsize = (15, ((n-1)//5 + 1)*3))
+        fig.suptitle(f'Building {self.id}')
+        for ax in axs.flatten():
+            ax.axis('off')
 
+        for i, key in enumerate(self.cutout_corners):
+            corners = self.cutout_corners[key]
+            im =  plt.imread(f'../results/cutouts/{self.id}_{key}.png')
+            axs.flatten()[i].imshow(im)
+            axs.flatten()[i].set_title(int(key.split('_')[-1]))
+
+            if plot_graph:
+                for j, edge in enumerate(self.edges):
+                    for ind in edge:
+                        axs[i].plot([corners[j, 0], corners[ind, 0]],
+                                    [corners[j, 1], corners[ind, 1]],
+                                    zorder=0, color='darkorange')
+                        
+                axs[i].scatter(*corners.T, color='red', s=12)
+        plt.show()
+        
 def shrink_polygon(image_polygon, factor=0.10):
     """
     Helper function for Extract_buildings 
@@ -104,6 +132,7 @@ def load_sfkb(json_path='../data/SFKB/geojson.json', max_buildings=None):
                 edges.append(edge.astype(int))
             
             buildings.append(Building(utm_corners, edges, building['building_id'])) # Intialize building objects with utm corners, edges indices and building ids
+
     return buildings
 
 def get_image_ids(buildings, dict_dump_path='../results', sosi_path = '../data/sosi.txt'):
@@ -135,14 +164,12 @@ def get_image_ids(buildings, dict_dump_path='../results', sosi_path = '../data/s
             if line.startswith('...BILDEFILRGB'):
                 ids.append(line.split('"')[1].split('.')[0])
         rects.append(rect[:-1])
+
     rects = rects[1:]
+    
     coverage = list()
-    association_dict = dict()
-
-
     for i, rect in enumerate(rects): # Cleanup and conversion to int
-        l_arr = np.empty((len(rect[2:]), 2))
-        association_dict[ids[i]] = list()
+        l_arr = np.empty((len(rect[2:]), 2)) # array to hold points delineating the coverage area border
         
         for j, item in enumerate(rect[2:]):
             line = item[0].replace(r'\n', ' ').split(' ')
@@ -151,30 +178,29 @@ def get_image_ids(buildings, dict_dump_path='../results', sosi_path = '../data/s
             l_arr[j] = line
 
         inds = (np.argmin(l_arr[:,0]), np.argmin(l_arr[:,1]),np.argmax(l_arr[:,0]), np.argmax(l_arr[:,1])) # indices of rectangle corners
-        poly = Polygon(l_arr[inds, ::-1]) # coverage polygon in UTM coords for an aerial image
-        counter = 0
-        for building in buildings:
-            if shrink_polygon(poly, factor=0.01).contains(Point(building.utm_mean[:-1])): # Using shapely functionality to determine wether the mean of the building is within the coverage area
-                association_dict[ids[i]].append(building.id)
-                building.image_ids.append(ids[i])
-                building.cutout_corners.append(0)
-                counter +=1
-        
-        
-        coverage.append(poly)
-        
-    for i, building in enumerate(buildings): # deletes building objects if the building is not in an image
-        if len(building.image_ids) <2 :
-            buildings.pop(i)
+        poly = shrink_polygon(Polygon(l_arr[inds, ::-1]), factor=0.005) # coverage polygon in UTM coords for an aerial image
 
+        for building in buildings:
+            counter = 0
+            for corner in building.utm_corners:
+                if not poly.contains(Point(corner)):
+                    counter +=1
+            if counter == 0:
+                if ids[i] not in building.image_corners.keys():
+                    building.image_corners[ids[i]] = list()
+
+        coverage.append(poly)
+
+    _buildings = list()
+    for i, building in enumerate(buildings): # deletes building objects if the building is not in an image
+        if len(building.image_corners) > 1 :
+            _buildings.append(building)  
+    buildings = _buildings
 
     if not os.path.exists(dict_dump_path):
         os.makedirs(dict_dump_path)
 
-    with open(f'{dict_dump_path}/image_to_building_pointers.pickle', 'wb') as handle:
-        pickle.dump(association_dict, handle)  
     return buildings
-
 
 
 
@@ -209,7 +235,7 @@ def get_camera_properites(image_id, metadata_path='../data/Aerial_Photos/GNSSINS
     focal_length = int(100.5*1e-3/4e-6) # image coordinates
     ny, nx = 26460, 17004
     ppa = np.array((nx/2 + int(0.08*1e-3/4e-6), ny/2)) # image coordinates
-    image_id_int = int(image_id[-3:])
+    image_id_int = int(image_id[-3:])-1
     return [metadata.loc[image_id_int][i] for i in ['x', 'y', 'z', 'rx', 'ry', 'rz']] + [focal_length, ppa]
 
 
@@ -233,6 +259,7 @@ def utm_to_image(utm_coords, image_id):
     '''
     converts coordinates of a single building to the image coordinates 
     of a single aerial image.
+
     '''
     nx = 17004
     CM = camera_matrix(image_id)
@@ -242,27 +269,68 @@ def utm_to_image(utm_coords, image_id):
     im_coords[0] = -im_coords[0] + nx 
     return im_coords.T
 
+
 def transform_utm_buildings(buildings):
     '''
     Transforms utm coordinates of building corners from utm to image coordinates
     in frames of every aerial photo in which the building appears
     '''
     for building in buildings:
-        for id in building.image_ids:
-            building.image_corners.append(utm_to_image(building.utm_corners, id))
+        for image_id in building.image_corners.keys():
+            building.image_corners[image_id] = utm_to_image(building.utm_corners, image_id)
     return buildings
 
 
-def dump_building_objects(buildings, path):
+def dump_cutouts_and_objects(buildings, image_ids,cutout_path='../results/cutouts', object_path='../results/objects', nudge=np.array((13,20)), pad=15, image_size=256):
     '''
-    Saves every building object in 'buidling' list to file at location given by 'path' 
-    '''
-    if not os.path.exists(path):
-        os.makedirs(path)
+    Extracts building cutouts from an list of aerial images referenced by the name of the image file.
+    Assumes pointer dictionary at ../results/image_to_building_pointers.pickle, 
+    aerial photos in ../data/aerial_photos/RGB/ and building objects in ../results/building_objects.
+    dumps images and objects at the paths given in the keyword arguments
 
-    for building in buildings:
-        with open(f'{path}/{building.id}.pickle', 'wb') as handle:
-            pickle.dump(building, handle)
+    '''
+
+    if not os.path.exists(cutout_path):
+        os.makedirs(cutout_path)
+
+    if not os.path.exists(object_path):
+        os.makedirs(object_path)
+
+    for image_id in image_ids:
+        aerial_photo = plt.imread(f'../data/aerial_photos/RGB/{image_id}.tif')
+        for i, building in enumerate(buildings):
+            if image_id in building.image_corners.keys():
+                corners = building.image_corners[image_id]
+                    
+
+                loc_min = np.min(corners, axis=0).astype(int) 
+                loc_max = np.max(corners, axis=0).astype(int)
+                
+                x_ext, y_ext = loc_max[0]-loc_min[0], loc_max[1]-loc_min[1]
+
+                if x_ext > y_ext: # Pad shortest axis
+                    sq_pad = np.array((0, (x_ext-y_ext)/2)).astype(int)
+                else:
+                    sq_pad = np.array(((y_ext-x_ext)/2, 0)).astype(int)
+
+                
+
+                im =  aerial_photo[loc_min[1]-pad-sq_pad[1]:loc_max[1]+2*pad +sq_pad[1]+ nudge[1], loc_min[0]-pad - sq_pad[0]:loc_max[0]+2*pad + nudge[0]+sq_pad[0]] # crop cutout
+                graph_cutout = ((corners.T-loc_min.reshape(-1, 1)+pad+nudge.reshape(-1, 1) + sq_pad.reshape(-1, 1))*image_size/np.array(im.shape[:2]).reshape(2, 1)).T # transform graph to cutout frame 
+                buildings[i].cutout_corners[image_id] = graph_cutout
+            
+                d_min = np.min(im.shape[:2])
+                try:    
+                    im = cv2.resize(im[:d_min, :d_min], (image_size, image_size))
+                    plt.imsave(f'{cutout_path}/{building.id}_{image_id}.png', im)
+                    with open(f'{object_path}/{building.id}.pickle', 'wb') as handle:
+                        pickle.dump(building, handle)
+                except cv2.error:
+                    del buildings[i]
+                    pass
+                    
+
+        print(f'image {image_id} done')
 
 def triangulate_Npts(pt2d_CxPx2, P_Cx3x4):
     """
